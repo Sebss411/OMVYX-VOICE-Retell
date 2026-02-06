@@ -53,10 +53,14 @@ async def health():
 # ---------------------------------------------------------------------------
 
 
-@app.websocket("/retell-webhook")
-async def retell_websocket(ws: WebSocket):
+@app.websocket("/retell-webhook/{call_id}")
+async def retell_websocket(ws: WebSocket, call_id: str):
     """
     Real-time bidirectional communication with Retell AI.
+
+    Retell connects to /retell-webhook/{call_id} where call_id identifies
+    the active call.  This ID is used as LangGraph's thread_id for
+    checkpointer persistence.
 
     NON-BLOCKING ARCHITECTURE:
         The main while-loop only reads incoming WebSocket frames and
@@ -64,15 +68,14 @@ async def retell_websocket(ws: WebSocket):
         objects so the loop is always free to process interrupts.
 
     Retell events handled:
-        - interaction_begin          → extract call_id, optional greeting
-        - interaction_update
-            type: response_required  → cancel current + launch new task
-            type: interrupt          → cancel current task immediately
+        - interaction_begin / call_details → optional agent greeting
+        - response_required               → cancel current + launch new task
+        - interrupt / update_only          → cancel current task immediately
     """
     await ws.accept()
+    logger.info("WebSocket connected — call_id=%s", call_id)
 
     current_task: asyncio.Task | None = None
-    call_id: str | None = None
 
     # ---------------------------------------------------------------
     # Generation handler — runs inside its own asyncio.Task
@@ -168,14 +171,10 @@ async def retell_websocket(ws: WebSocket):
 
             # ========= INTERACTION BEGIN / CALL DETAILS =========
             if interaction_type == "call_details" or event == "interaction_begin":
-                call_id = (
-                    data.get("call_id")
-                    or data.get("call", {}).get("call_id")
-                )
                 logger.info("Call started — call_id=%s", call_id)
 
                 initiator = data.get("initiator", "")
-                if initiator == "agent" and call_id:
+                if initiator == "agent":
                     # Agent-initiated call: launch greeting task
                     current_task = asyncio.create_task(
                         handle_generation([], 0, call_id)
@@ -198,7 +197,7 @@ async def retell_websocket(ws: WebSocket):
                     handle_generation(
                         transcript,
                         response_id,
-                        call_id or "unknown",
+                        call_id,
                     )
                 )
 
@@ -223,7 +222,7 @@ async def retell_websocket(ws: WebSocket):
                     handle_generation(
                         data.get("transcript", []),
                         response_id,
-                        call_id or "unknown",
+                        call_id,
                     )
                 )
 
