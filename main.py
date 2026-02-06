@@ -1,25 +1,26 @@
 """
-Omvyx Voice — FastAPI Server
+Omvyx Voice — FastAPI Server (WebSocket)
 
-Exposes a single POST /retell-webhook endpoint that receives Retell AI
-payloads and routes them through the LangGraph workflow.
+Exposes a WebSocket /retell-webhook endpoint that handles real-time
+bidirectional communication with Retell AI.
 
-Key design:
-    - The Retell `call_id` is used as LangGraph's `thread_id` so the
-      checkpointer can restore the full conversation state on every
-      stateless HTTP request.
-    - The graph is compiled once at startup with a MemorySaver checkpointer.
-    - For production, swap MemorySaver with AsyncSqliteSaver (or Redis)
-      so state survives server restarts.
+Architecture:
+    - NON-BLOCKING: Graph inference runs in asyncio.create_task(), never
+      blocking the main receive loop.  This allows the loop to process
+      interrupt signals immediately.
+    - The Retell call_id is used as LangGraph's thread_id so the
+      checkpointer restores full conversation state across turns.
+    - graph/workflow.py is treated as IMMUTABLE (read-only).
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from langchain_core.messages import HumanMessage
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from graph.workflow import SYSTEM_PROMPT, compile_graph
 
@@ -37,10 +38,10 @@ logger = logging.getLogger("omvyx")
 app = FastAPI(title="Omvyx Voice", version="1.0.0")
 graph = compile_graph()  # single process — MemorySaver is fine
 
-
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
+
 
 @app.get("/health")
 async def health():
@@ -48,74 +49,199 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Retell Webhook
+# Retell WebSocket Endpoint
 # ---------------------------------------------------------------------------
 
-@app.post("/retell-webhook")
-async def retell_webhook(request: Request):
+
+@app.websocket("/retell-webhook")
+async def retell_websocket(ws: WebSocket):
     """
-    Retell sends a JSON payload on every conversational turn.
+    Real-time bidirectional communication with Retell AI.
 
-    Expected payload shape (simplified):
-        {
-            "call_id": "...",
-            "event": "call_started" | "call_ended" | "call_analyzed",
-            "transcript": [
-                {"role": "agent", "content": "..."},
-                {"role": "user",  "content": "..."}
-            ]
-        }
+    NON-BLOCKING ARCHITECTURE:
+        The main while-loop only reads incoming WebSocket frames and
+        dispatches work.  All graph inference runs inside asyncio.Task
+        objects so the loop is always free to process interrupts.
 
-    We extract the last user utterance, invoke the LangGraph workflow
-    with the call_id as thread_id, and return the agent's response.
+    Retell events handled:
+        - interaction_begin          → extract call_id, optional greeting
+        - interaction_update
+            type: response_required  → cancel current + launch new task
+            type: interrupt          → cancel current task immediately
     """
-    body = await request.json()
-    call_id: str = body.get("call_id", "unknown")
-    event: str = body.get("event", "")
+    await ws.accept()
 
-    logger.info("Webhook received — call_id=%s  event=%s", call_id, event)
+    current_task: asyncio.Task | None = None
+    call_id: str | None = None
 
-    # Retell fires events for lifecycle stages we don't need to respond to
-    if event in ("call_ended", "call_analyzed"):
-        return JSONResponse({"response_id": call_id, "content": ""})
+    # ---------------------------------------------------------------
+    # Generation handler — runs inside its own asyncio.Task
+    # ---------------------------------------------------------------
 
-    # Extract the last user utterance from the transcript
-    transcript: list[dict] = body.get("transcript", [])
-    user_text = ""
-    for turn in reversed(transcript):
-        if turn.get("role") == "user":
-            user_text = turn.get("content", "")
-            break
+    async def handle_generation(
+        transcript: list[dict],
+        response_id: int,
+        cid: str,
+    ) -> None:
+        """
+        Run the LangGraph workflow and send the response to Retell.
 
-    if not user_text:
-        # First turn (call_started with no transcript yet) — greet
-        user_text = "Hola"
+        This coroutine is always wrapped in asyncio.create_task() so it
+        can be cancelled when the user interrupts.
 
-    # Invoke graph with checkpointing via thread_id = call_id
-    config = {"configurable": {"thread_id": call_id}}
-    input_state = {
-        "messages": [SYSTEM_PROMPT, HumanMessage(content=user_text)],
-        "call_id": call_id,
-    }
+        The graph is deterministic (no LLM token streaming), so we use
+        ainvoke and send the complete response.  The non-blocking Task
+        wrapper is what enables instant interrupt handling.
+        """
+        try:
+            # Extract last user utterance from transcript
+            user_text = ""
+            for turn in reversed(transcript):
+                if turn.get("role") == "user":
+                    user_text = turn.get("content", "")
+                    break
 
-    result = await graph.ainvoke(input_state, config=config)
+            if not user_text:
+                user_text = "Hola"
 
-    # The last AI message is the response to send back to Retell
-    agent_reply = ""
-    for msg in reversed(result.get("messages", [])):
-        if hasattr(msg, "content") and msg.type == "ai":
-            agent_reply = msg.content
-            break
+            # Config with thread_id for checkpointer persistence
+            config = {"configurable": {"thread_id": cid}}
 
-    logger.info("Responding — call_id=%s  reply=%s", call_id, agent_reply[:80])
+            # Input state: inject SYSTEM_PROMPT + user message
+            input_state = {
+                "messages": [SYSTEM_PROMPT, HumanMessage(content=user_text)],
+                "call_id": cid,
+            }
 
-    # Retell expects this response shape
-    return JSONResponse({
-        "response_id": call_id,
-        "content": agent_reply,
-        "content_complete": True,
-        "end_call": False,
-    })
+            # Run the graph (deterministic nodes — adapted from
+            # astream_events to ainvoke since there's no LLM streaming)
+            result = await graph.ainvoke(input_state, config=config)
+
+            # Extract the last AI message as the agent reply
+            agent_reply = ""
+            for msg in reversed(result.get("messages", [])):
+                if hasattr(msg, "content") and msg.type == "ai":
+                    agent_reply = msg.content
+                    break
+
+            logger.info("Response — call_id=%s reply=%s", cid, agent_reply[:80])
+
+            # Send content chunk to Retell
+            if agent_reply:
+                await ws.send_json({
+                    "response_id": response_id,
+                    "content": agent_reply,
+                    "content_complete": False,
+                })
+
+            # Signal stream completion
+            await ws.send_json({
+                "response_id": response_id,
+                "content": "",
+                "content_complete": True,
+            })
+
+        except asyncio.CancelledError:
+            # Interrupted by user — exit silently
+            logger.info(
+                "Generation cancelled — call_id=%s response_id=%s", cid, response_id
+            )
+            return
+
+        except Exception:
+            logger.exception("Generation error — call_id=%s", cid)
+
+    # ---------------------------------------------------------------
+    # Main receive loop
+    # ---------------------------------------------------------------
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            data: dict = json.loads(raw)
+
+            # Support both Retell's native "interaction_type" field
+            # and the "event" + "type" wrapper format
+            interaction_type = data.get("interaction_type", "")
+            event = data.get("event", "")
+            update_type = data.get("type", "")
+
+            # ========= INTERACTION BEGIN / CALL DETAILS =========
+            if interaction_type == "call_details" or event == "interaction_begin":
+                call_id = (
+                    data.get("call_id")
+                    or data.get("call", {}).get("call_id")
+                )
+                logger.info("Call started — call_id=%s", call_id)
+
+                initiator = data.get("initiator", "")
+                if initiator == "agent" and call_id:
+                    # Agent-initiated call: launch greeting task
+                    current_task = asyncio.create_task(
+                        handle_generation([], 0, call_id)
+                    )
+
+            # ========= RESPONSE REQUIRED =========
+            elif (
+                interaction_type == "response_required"
+                or (event == "interaction_update" and update_type == "response_required")
+            ):
+                # Step 1: Cancel running generation (non-blocking)
+                if current_task and not current_task.done():
+                    current_task.cancel()
+
+                # Step 2: Launch new generation task
+                transcript = data.get("transcript", [])
+                response_id = data.get("response_id", 0)
+
+                current_task = asyncio.create_task(
+                    handle_generation(
+                        transcript,
+                        response_id,
+                        call_id or "unknown",
+                    )
+                )
+
+            # ========= INTERRUPT =========
+            elif (
+                interaction_type == "update_only"
+                or (event == "interaction_update" and update_type == "interrupt")
+            ):
+                # Immediate cancellation — do NOT send anything to the socket
+                if current_task and not current_task.done():
+                    current_task.cancel()
+                logger.info("Interrupt received — call_id=%s", call_id)
+
+            # ========= REMINDER REQUIRED =========
+            elif interaction_type == "reminder_required":
+                # Agent hasn't spoken for a while — re-trigger generation
+                if current_task and not current_task.done():
+                    current_task.cancel()
+
+                response_id = data.get("response_id", 0)
+                current_task = asyncio.create_task(
+                    handle_generation(
+                        data.get("transcript", []),
+                        response_id,
+                        call_id or "unknown",
+                    )
+                )
+
+            # ========= PING / PONG =========
+            elif interaction_type == "ping_pong":
+                await ws.send_json({
+                    "interaction_type": "ping_pong",
+                    "timestamp": data.get("timestamp", 0),
+                })
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected — call_id=%s", call_id)
+    except Exception:
+        logger.exception("WebSocket error — call_id=%s", call_id)
+    finally:
+        # Clean up any in-flight task
+        if current_task and not current_task.done():
+            current_task.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -124,4 +250,5 @@ async def retell_webhook(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
